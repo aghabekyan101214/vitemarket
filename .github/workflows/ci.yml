@@ -1,0 +1,118 @@
+# CI: lint + types, tests against real Postgres/SeaweedFS (same compose stack as local),
+# production image build; on main the image is pushed to GHCR as <YYYY.MM.DD>-<sha7>
+# (the tag format API_TAG expects in .env.prod).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint & types
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.30"
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - name: Lockfile is up to date
+        run: uv lock --check
+      - run: uv sync --frozen
+      - name: Format
+        run: uv run ruff format --check app tests migrations
+      - name: Lint
+        run: uv run ruff check app tests migrations
+      - name: Types
+        run: uv run mypy app tests
+
+  test:
+    name: tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build dev image
+        run: docker compose build api
+      - name: Start Postgres and SeaweedFS
+        run: |
+          docker compose up -d --wait db storage
+          docker compose run --rm storage-init
+      - name: Migrations apply cleanly and match the models
+        run: >
+          docker compose run --rm --no-deps -e DATABASE_URL=postgresql+asyncpg://showcase:showcase@db:5432/showcase_test
+          api sh -c "alembic upgrade head && alembic check"
+      - name: Tests
+        run: >
+          docker compose run --rm --no-deps api
+          pytest -q -W error::DeprecationWarning --junitxml=/app/junit.xml
+      - name: Test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: backend/junit.xml
+          if-no-files-found: ignore
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose logs db storage
+      - if: always()
+        run: docker compose down -v
+
+  image:
+    name: production image
+    needs: [lint, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Compute tags
+        id: meta
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/showcase-api"
+          tag="$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "### Image: \`$image:$tag\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: prod
+          load: ${{ github.ref != 'refs/heads/main' }}
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:main
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=prod
+          cache-to: type=gha,scope=prod,mode=max
+      - name: Smoke test (PR builds; main pushes without loading)
+        if: github.ref != 'refs/heads/main'
+        run: infra/scripts/smoke-test-image.sh "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
