@@ -3,8 +3,10 @@
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod pull
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 #
-# Traffic path:  Cloudflare edge -> Cloudflare Tunnel (cloudflared) -> api:8000
-# No host ports are published; the VM needs only outbound internet.
+# Traffic path (current):  client -> host nginx (TLS, infra/nginx/showcase-api.conf) -> 127.0.0.1:8000 -> api
+# Traffic path (planned, CLOUDFLARE_PLAN.md):  Cloudflare edge -> Tunnel (`--profile tunnel`) -> api:8000
+# Only 127.0.0.1:8000 is published, so the API is never reachable around nginx.
+# Deploys: CI runs infra/scripts/deploy.sh over SSH (docs/runbooks/deploy.md).
 # Images/media live in Cloudflare R2 (no storage container here).
 # Visitors hit the statically generated Next.js sites, not this API.
 
@@ -24,6 +26,7 @@ x-backend: &backend
   env_file: .env.prod
   environment:
     APP_ENV: production
+    APP_VERSION: ${API_TAG}
     DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
   logging: *logging
   restart: unless-stopped
@@ -91,8 +94,9 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    expose:
-      - "8000"
+    ports:
+      # Loopback only: host nginx proxies here (Docker would bypass ufw for a public port).
+      - "127.0.0.1:8000:8000"
     deploy:
       resources:
         limits:
@@ -114,11 +118,13 @@ services:
           memory: 256m
 
   # Cloudflare Tunnel: route e.g. api.<your-admin-domain> -> http://api:8000 in the CF dashboard.
+  # Off until a domain is on Cloudflare: start with `--profile tunnel` and set CLOUDFLARE_TUNNEL_TOKEN.
   cloudflared:
     image: cloudflare/cloudflared:2026.10.7
+    profiles: ["tunnel"]
     command: ["tunnel", "--no-autoupdate", "run"]
     environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?}
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
     depends_on:
       api:
         condition: service_healthy

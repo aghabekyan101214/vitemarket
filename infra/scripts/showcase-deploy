@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Installed as /usr/local/bin/showcase-deploy by server-setup.sh. It is the forced command of
+# the CI deploy key (~deploy/.ssh/authorized_keys), so CI can only send an image tag.
+# It checks out the commit the image was built from and hands over to that commit's deploy.sh.
+set -euo pipefail
+tag="${SSH_ORIGINAL_COMMAND:-${1:-}}"
+if [[ ! "$tag" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{7}$ ]]; then
+  echo "usage: showcase-deploy <YYYY.MM.DD-sha7>" >&2
+  exit 2
+fi
+cd /srv/showcase
+git fetch --quiet origin main
+git checkout --quiet --detach "${tag##*-}"
+exec infra/scripts/deploy.sh "$tag"
